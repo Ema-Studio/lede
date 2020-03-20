@@ -7,17 +7,21 @@ require 'nixio'
 require 'luci.util'
 require 'luci.jsonc'
 require 'luci.sys'
-
+require 'uci'
 -- these global functions are accessed all the time by the event handler
 -- so caching them is worth the effort
+local luci = luci
 local tinsert = table.insert
-local ssub, slen, schar, srep, sbyte, sformat, sgsub = string.sub, string.len, string.char, string.rep, string.byte, string.format, string.gsub
+local ssub, slen, schar, sbyte, sformat, sgsub = string.sub, string.len, string.char, string.byte, string.format, string.gsub
+local jsonParse, jsonStringify = luci.jsonc.parse, luci.jsonc.stringify
+local b64decode = nixio.bin.b64decode
 local cache = {}
 local nodeResult = setmetatable({}, { __index = cache })  -- update result
 local name = 'shadowsocksr'
 local uciType = 'servers'
-local ucic = luci.model.uci.cursor()
+local ucic = uci.cursor()
 local proxy = ucic:get_first(name, 'server_subscribe', 'proxy', '0')
+local switch = ucic:get_first(name, 'server_subscribe', 'switch', '1')
 local subscribe_url = ucic:get_first(name, 'server_subscribe', 'subscribe_url', {})
 
 local log = function(...)
@@ -28,7 +32,7 @@ local function split(full, sep)
 	full = full:gsub("%z", "")  -- 这里不是很清楚 有时候结尾带个\0
 	local off, result = 1, {}
 	while true do
-		local nEnd = full:find(sep, off)
+		local nStart, nEnd = full:find(sep, off)
 		if not nEnd then
 			local res = ssub(full, off, slen(full))
 			if #res > 0 then -- 过滤掉 \0
@@ -36,8 +40,8 @@ local function split(full, sep)
 			end
 			break
 		else
-			tinsert(result, ssub(full, off, nEnd - 1))
-			off = nEnd + slen(sep)
+			tinsert(result, ssub(full, off, nStart - 1))
+			off = nEnd + 1
 		end
 	end
 	return result
@@ -74,17 +78,15 @@ local function md5(content)
 	return trim(stdout)
 end
 -- base64
-local function base64Decode(text, safe)
+local function base64Decode(text)
 	local raw = text
 	if not text then return '' end
 	text = text:gsub("%z", "")
-	if safe then
-		text = text:gsub("_", "/")
-		text = text:gsub("-", "+")
-		local mod4 = #text % 4
-		text = text .. string.sub('====', mod4 + 1)
-	end
-	local result = nixio.bin.b64decode(text)
+	text = text:gsub("_", "/")
+	text = text:gsub("-", "+")
+	local mod4 = #text % 4
+	text = text .. string.sub('====', mod4 + 1)
+	local result = b64decode(text)
 	if result then
 		return result:gsub("%z", "")
 	else
@@ -94,46 +96,33 @@ end
 -- 处理数据
 local function processData(szType, content)
 	local result = {
-		auth_enable = '0',
-		switch_enable = '1',
-		type = szType,
-		local_port = 1234,
-		timeout = 60, -- 不太确定 好像是死的
-		fast_open = 0,
-		kcp_enable = 0,
-		kcp_port = 0,
-		kcp_param = '--nocomp'
+	type = szType,
+	local_port = 1234,
+	kcp_param = '--nocomp'
 	}
-	local hash
-	if type(content) == 'string' then
-		hash = md5(content)
-	else
-		hash = md5(luci.jsonc.stringify(content))
-	end
-	result.hashkey = hash
 	if szType == 'ssr' then
-		local dat = split(content, "/\\?")
+		local dat = split(content, "/%?")
 		local hostInfo = split(dat[1], ':')
 		result.server = hostInfo[1]
 		result.server_port = hostInfo[2]
 		result.protocol = hostInfo[3]
 		result.encrypt_method = hostInfo[4]
 		result.obfs = hostInfo[5]
-		result.password = base64Decode(hostInfo[6], true)
+		result.password = base64Decode(hostInfo[6])
 		local params = {}
-		for k, v in pairs(split(dat[2], '&')) do
+		for _, v in pairs(split(dat[2], '&')) do
 			local t = split(v, '=')
 			params[t[1]] = t[2]
 		end
-		result.obfs_param = base64Decode(params.bfsparam, true)
-		result.protocol_param = base64Decode(params.protoparam, true)
-		local group = base64Decode(params.group, true)
+		result.obfs_param = base64Decode(params.obfsparam)
+		result.protocol_param = base64Decode(params.protoparam)
+		local group = base64Decode(params.group)
 		if group then
 			result.alias = "["  .. group .. "] "
 		end
-		result.alias = result.alias .. base64Decode(params.remarks, true)
+		result.alias = result.alias .. base64Decode(params.remarks)
 	elseif szType == 'vmess' then
-		local info = luci.jsonc.parse(content)
+		local info = jsonParse(content)
 		result.type = 'v2ray'
 		result.server = info.add
 		result.server_port = info.port
@@ -141,37 +130,38 @@ local function processData(szType, content)
 		result.alter_id = info.aid
 		result.vmess_id = info.id
 		result.alias = info.ps
-		result.mux = 1
-		result.concurrency = 8
-		if info.net == 'ws'then
-		result.ws_host = info.host
-		result.ws_path = info.path
+		result.insecure = 1
+		-- result.mux = 1
+		-- result.concurrency = 8
+		if info.net == 'ws' then
+			result.ws_host = info.host
+			result.ws_path = info.path
 		end
-		if info.net == 'h2'then
-		result.h2_host = info.host
-		result.h2_path = info.path
+		if info.net == 'h2' then
+			result.h2_host = info.host
+			result.h2_path = info.path
 		end
-		if info.net == 'tcp'then
-		result.tcp_guise = info.type
-		result.http_host = info.host
-		result.http_path = info.path
+		if info.net == 'tcp' then
+			result.tcp_guise = info.type
+			result.http_host = info.host
+			result.http_path = info.path
 		end
-		if info.net == 'kcp'then
-		result.kcp_guise = info.type
-		result.mtu = 1350
-		result.tti = 50
-		result.uplink_capacity = 5
-		result.downlink_capacity = 20
-		result.read_buffer_size = 2
-		result.write_buffer_size = 2
+		if info.net == 'kcp' then
+			result.kcp_guise = info.type
+			result.mtu = 1350
+			result.tti = 50
+			result.uplink_capacity = 5
+			result.downlink_capacity = 20
+			result.read_buffer_size = 2
+			result.write_buffer_size = 2
 		end
-		if info.net == 'quic'then
-		result.quic_guise = info.type
-		result.quic_key = info.key
-		result.quic_security = info.securty
+		if info.net == 'quic' then
+			result.quic_guise = info.type
+			result.quic_key = info.key
+			result.quic_security = info.securty
 		end
-		if not info.security then
-			result.security = "auto"
+		if info.security then
+			result.security = info.security
 		end
 		if info.tls == "tls" or info.tls == "1" then
 			result.tls = "1"
@@ -187,23 +177,32 @@ local function processData(szType, content)
 			alias = content:sub(idx_sp + 1, -1)
 		end
 		local info = content:sub(1, idx_sp - 1)
-		local hostInfo = split(base64Decode(info, true), "@")
+		local hostInfo = split(base64Decode(info), "@")
 		local host = split(hostInfo[2], ":")
-		local userinfo = base64Decode(hostInfo[1], true)
+		local userinfo = base64Decode(hostInfo[1])
 		local method = userinfo:sub(1, userinfo:find(":") - 1)
 		local password = userinfo:sub(userinfo:find(":") + 1, #userinfo)
 		result.alias = UrlDecode(alias)
 		result.type = "ss"
 		result.server = host[1]
-		if host[2]:find("/\\?") then
-			local query = split(host[2], "/\\?")
+		if host[2]:find("/%?") then
+			local query = split(host[2], "/%?")
 			result.server_port = query[1]
-			-- local params = {}
-			-- for k, v in pairs(split(query[2], '&')) do
-			--   local t = split(v, '=')
-			--   params[t[1]] = t[2]
-			-- end
-			-- 这里似乎没什么用 我看数据结构没有写插件的支持 先抛弃
+			local params = {}
+			for _, v in pairs(split(query[2], '&')) do
+				local t = split(v, '=')
+				params[t[1]] = t[2]
+			end
+			if params.plugin then
+				local plugin_info = UrlDecode(params.plugin)
+				local idx_pn = plugin_info:find(";")
+				if idx_pn then
+					result.plugin = plugin_info:sub(1, idx_pn - 1)
+					result.plugin_opts = plugin_info:sub(idx_pn + 1, #plugin_info)
+				else
+					result.plugin = plugin_info
+				end
+			end
 		else
 			result.server_port = host[2]
 		end
@@ -215,21 +214,73 @@ local function processData(szType, content)
 		result.server_port = content.port
 		result.password = content.password
 		result.encrypt_method_ss = content.encryption
+		result.plugin = content.plugin
+		result.plugin_opts = content.plugin_options
 		result.alias = "[" .. content.airport .. "] " .. content.remarks
+	elseif szType == "trojan" then
+		local idx_sp = 0
+		local alias = ""
+		if content:find("#") then
+			idx_sp = content:find("#")
+			alias = content:sub(idx_sp + 1, -1)
+		end
+		local info = content:sub(1, idx_sp - 1)
+		local hostInfo = split(info, "@")
+		local host = split(hostInfo[2], ":")
+		local userinfo = hostInfo[1]
+		local password = userinfo
+		result.alias = UrlDecode(alias)
+		result.type = "trojan"
+		result.server = host[1]
+		-- 按照官方的建议 默认验证ssl证书
+		result.insecure = "0"
+		result.tls = "1"
+		if host[2]:find("?") then
+			local query = split(host[2], "?")
+			result.server_port = query[1]
+			local params = {}
+			for _, v in pairs(split(query[2], '&')) do
+				local t = split(v, '=')
+				params[t[1]] = t[2]
+			end
+			
+			if params.peer then
+				-- 未指定peer（sni）默认使用remote addr
+				result.tls_host = params.peer
+			end
+			
+			if params.allowInsecure == "1" then
+				result.insecure = "1"
+			else
+				result.insecure = "0"
+			end
+		else
+			result.server_port = host[2]
+		end
+		result.password = password
 	end
-	if result.alias == ''then result.alias = result.server ..':'.. result.server_port end
-	return result, hash
+	if not result.alias then
+		result.alias = result.server .. ':' .. result.server_port
+	end
+	-- alias 不参与 hashkey 计算
+	local alias = result.alias
+	result.alias = nil
+	local switch_enable = result.switch_enable
+	result.switch_enable = nil
+	result.hashkey = md5(jsonStringify(result))
+	result.alias = alias
+	result.switch_enable = switch_enable
+	return result
 end
 -- wget
 local function wget(url)
-	local stdout = luci.sys.exec('wget-ssl --user-agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/77.0.3865.90 Safari/537.36" --no-check-certificate -t 3 -T 10 -O- "' .. url .. '"')
+	local stdout = luci.sys.exec('wget-ssl --user-agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/44.0.2403.157 Safari/537.36" --no-check-certificate -t 3 -T 10 -O- "' .. url .. '"')
 	return trim(stdout)
 end
 
 local execute = function()
 	-- exec
 	do
-		-- subscribe_url = {'https://www.google.comc'}
 		if proxy == '0' then -- 不使用代理更新的话先暂停
 			log('服务正在暂停')
 			luci.sys.init.stop(name)
@@ -237,7 +288,7 @@ local execute = function()
 		for k, url in ipairs(subscribe_url) do
 			local raw = wget(url)
 			if #raw > 0 then
-				local node, szType
+				local nodes, szType
 				local groupHash = md5(url)
 				cache[groupHash] = {}
 				tinsert(nodeResult, {})
@@ -246,67 +297,74 @@ local execute = function()
 				if raw:find('ssd://') then
 					szType = 'ssd'
 					local nEnd = select(2, raw:find('ssd://'))
-					node = base64Decode(raw:sub(nEnd + 1, #raw), true)
-					node = luci.jsonc.parse(node)
+					nodes = base64Decode(raw:sub(nEnd + 1, #raw))
+					nodes = jsonParse(nodes)
 					local extra = {
-						airport = node.airport,
-						port = node.port,
-						encryption = node.encryption,
-						password = node.password
+						airport = nodes.airport,
+						port = nodes.port,
+						encryption = nodes.encryption,
+						password = nodes.password
 					}
 					local servers = {}
 					-- SS里面包着 干脆直接这样
-					for _, server in ipairs(node.servers) do
+					for _, server in ipairs(nodes.servers) do
 						tinsert(servers, setmetatable(server, { __index = extra }))
 					end
-					node = servers
+					nodes = servers
 				else
 					-- ssd 外的格式
-					node = split(base64Decode(raw, true):gsub(" ", "\n"), "\n")
+					nodes = split(base64Decode(raw):gsub(" ", "\n"), "\n")
 				end
-				for _, v in ipairs(node) do
+				for _, v in ipairs(nodes) do
 					if v then
-						v = trim(v)
-						local result, hash
+						local result
 						if szType == 'ssd' then
-							result, hash = processData(szType, v)
+							result = processData(szType, v)
 						elseif not szType then
-							local dat = split(v, "://")
+							local node = trim(v)
+							local dat = split(node, "://")
 							if dat and dat[1] and dat[2] then
-								if dat[1] == 'ss' then
-									result, hash = processData(dat[1], dat[2])
+								if dat[1] == 'ss' or dat[1] == 'trojan' then
+									result = processData(dat[1], dat[2])
 								else
-									result, hash = processData(dat[1], base64Decode(dat[2], true))
+									result = processData(dat[1], base64Decode(dat[2]))
 								end
 							end
 						else
 							log('跳过未知类型: ' .. szType)
 						end
-						-- log(hash, result)
-						if hash or result then
+						-- log(result)
+						if result then
 							if result.alias:find("过期时间") or
 								result.alias:find("剩余流量") or
 								result.alias:find("QQ群") or
 								result.alias:find("官网") or
-								result.server == ''
+								result.alias:find("防失联地址") or
+								not result.server or
+								result.server:match("[^0-9a-zA-Z%-%.%s]") -- 中文做地址的 也没有人拿中文域名搞，就算中文域也有Puny Code SB 机场
 							then
 								log('丢弃无效节点: ' .. result.type ..' 节点, ' .. result.alias)
 							else
 								log('成功解析: ' .. result.type ..' 节点, ' .. result.alias)
 								result.grouphashkey = groupHash
 								tinsert(nodeResult[index], result)
-								cache[groupHash][hash] = nodeResult[index][#nodeResult[index]]
+								cache[groupHash][result.hashkey] = nodeResult[index][#nodeResult[index]]
 							end
 						end
 					end
 				end
-				log('成功解析节点数量: ' ..#node)
+				log('成功解析节点数量: ' ..#nodes)
+			else
+				log(url .. ': 获取内容为空')
 			end
 		end
 	end
 	-- diff
 	do
-		assert(next(nodeResult), "node result is empty")
+		if next(nodeResult) == nil then
+			log("更新失败，没有可用的节点信息")
+			return
+		end
 		local add, del = 0, 0
 		ucic:foreach(name, uciType, function(old)
 			if old.grouphashkey or old.hashkey then -- 没有 hash 的不参与删除
@@ -320,37 +378,45 @@ local execute = function()
 					setmetatable(nodeResult[old.grouphashkey][old.hashkey], { __index =  { _ignore = true } })
 				end
 			else
+				if not old.alias then
+					old.alias = old.server .. ':' .. old.server_port
+				end
 				log('忽略手动添加的节点: ' .. old.alias)
 			end
+
 		end)
 		for k, v in ipairs(nodeResult) do
 			for kk, vv in ipairs(v) do
 				if not vv._ignore then
 					local section = ucic:add(name, uciType)
 					ucic:tset(name, section, vv)
+					ucic:set(name, section, "switch_enable", switch)
 					add = add + 1
 				end
-
 			end
 		end
 		ucic:commit(name)
-		-- 如果服务器已经不见了把帮换一个
+		-- 如果原有服务器节点已经不见了就尝试换为第一个节点
 		local globalServer = ucic:get_first(name, 'global', 'global_server', '')
 		local firstServer = ucic:get_first(name, uciType)
-		if not ucic:get(name, globalServer) then
-			if firstServer then
-				ucic:set(name, ucic:get_first(name, 'global'), 'global_server', firstServer)
-				ucic:commit(name)
-				log('当前主服务器已更新，正在自动更换。')
-			end
-		end
 		if firstServer then
-			luci.sys.call("/etc/init.d/" .. name .." restart > /dev/null 2>&1 &") -- 不加&的话日志会出现的更早
+			if not ucic:get(name, globalServer) then
+				luci.sys.call("/etc/init.d/" .. name .. " stop > /dev/null 2>&1 &")
+				ucic:commit(name)
+				ucic:set(name, ucic:get_first(name, 'global'), 'global_server', ucic:get_first(name, uciType))
+				ucic:commit(name)
+				log('当前主服务器节点已被删除，正在自动更换为第一个节点。')
+				luci.sys.call("/etc/init.d/" .. name .. " start > /dev/null 2>&1 &")
+			else
+				log('维持当前主服务器节点。')
+				luci.sys.call("/etc/init.d/" .. name .." restart > /dev/null 2>&1 &")
+			end
 		else
-			luci.sys.call("/etc/init.d/" .. name .." stop > /dev/null 2>&1 &") -- 不加&的话日志会出现的更早
+			log('没有服务器节点了，停止服务')
+			luci.sys.call("/etc/init.d/" .. name .. " stop > /dev/null 2>&1 &")
 		end
 		log('新增节点数量: ' ..add, '删除节点数量: ' .. del)
-		log('更新成功服务正在启动')
+		log('订阅更新成功')
 	end
 end
 
@@ -362,8 +428,10 @@ if subscribe_url and #subscribe_url > 0 then
 		local firstServer = ucic:get_first(name, uciType)
 		if firstServer then
 			luci.sys.call("/etc/init.d/" .. name .." restart > /dev/null 2>&1 &") -- 不加&的话日志会出现的更早
+			log('重启服务成功')
 		else
 			luci.sys.call("/etc/init.d/" .. name .." stop > /dev/null 2>&1 &") -- 不加&的话日志会出现的更早
+			log('停止服务成功')
 		end
 	end)
 end
